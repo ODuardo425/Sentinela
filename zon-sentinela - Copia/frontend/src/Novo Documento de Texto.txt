@@ -1,0 +1,674 @@
+import { useState, useEffect, useCallback, useRef } from "react"
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+// Em produção: trocar para URL real do backend
+const API_BASE = ""
+
+const MANUAL_MAINTENANCES = {
+  CPZON03: { name: "ZON (CE) Posto Iguatemi — Fortaleza",  since: new Date("2026-04-07") },
+  CPZON28: { name: "ZON (SP) Madero Santo Amaro",          since: new Date("2026-03-11") },
+  CPZON57: { name: "ZON (PB) Shell Rodoviária — JP",       since: new Date("2026-03-24") },
+  CPZON32: { name: "ZON (CE) Pitaguary Mall — Maracanaú",  since: new Date("2026-02-21") },
+}
+
+// ─── CORES ZON ────────────────────────────────────────────────────────────────
+const C = {
+  bg: "#090909", card: "#111", border: "#1c1c1c", border2: "#252525",
+  yellow: "#FFD600", yellowDim: "#1a1400",
+  white: "#F0F0F0", gray: "#666", grayDim: "#1a1a1a",
+  green: "#00C853", greenDim: "#061a0e",
+  red: "#FF3B3B", redDim: "#1a0707",
+  orange: "#FF8C00", orangeDim: "#1a0e00",
+  blue: "#4A9EFF", blueDim: "#071628",
+  purple: "#A78BFA", purpleDim: "#120e1f",
+}
+
+const STATUS = {
+  operational: { label:"Operante",     dot:C.green,  bg:C.greenDim,  border:C.green  },
+  offline:     { label:"Offline",      dot:C.red,    bg:C.redDim,    border:C.red    },
+  error:       { label:"Em erro",      dot:C.orange, bg:C.orangeDim, border:C.orange },
+  maintenance: { label:"Manutenção",   dot:C.yellow, bg:C.yellowDim, border:C.yellow },
+  unavailable: { label:"Indisponível", dot:C.blue,   bg:C.blueDim,   border:C.blue   },
+  unknown:     { label:"Desconhecido", dot:C.gray,   bg:C.grayDim,   border:C.gray   },
+}
+
+const SILENT_LABEL = {
+  connector_status_frozen: "Status congelado",
+  meter_values_frozen:     "Meter frozen",
+  high_abort_rate:         "Alto abort rate",
+  remote_start_rejected:   "RemoteStart rejeitado",
+  zero_tx_peak:            "Sem tx no pico",
+  log_timeout_critico:     "Log timeout",
+  disconnect_1006_repeated:"Disconnect 1006",
+  emergency_stop:          "EmergencyStop",
+  all_connectors_faulted:  "Conectores faulted",
+  log_stale:               "Log antigo",
+}
+
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+function dur(ms) {
+  if (!ms || ms <= 0) return "—"
+  const s = Math.floor(ms/1000), m = Math.floor(s/60)
+  const h = Math.floor(m/60),    d = Math.floor(h/24)
+  if (d > 0) return `${d}d ${h%24}h`
+  if (h > 0) return `${h}h ${m%60}m`
+  if (m > 0) return `${m}m`
+  return `${s}s`
+}
+function ago(ts) { return ts ? dur(Date.now()-ts)+" atrás" : "sem sinal" }
+function fmtDate(ts) {
+  return new Date(ts).toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"})
+}
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit",second:"2-digit"})
+}
+
+// ─── HOOK SSE ─────────────────────────────────────────────────────────────────
+// Em modo demo (sem backend), usa dados simulados com IDs e nomes reais da ZON
+function useStations() {
+  const [stations, setStations]   = useState([])
+  const [connected, setConnected] = useState(false)
+  const [source, setSource]       = useState("demo") // "sse" | "poll" | "demo"
+  const [lastUpdate, setLastUpdate] = useState(null)
+
+  const applyMaintenance = useCallback((list) => {
+    return list.map(s => {
+      const mm = MANUAL_MAINTENANCES[s.stationID]
+      if (mm) return { ...s, status:"maintenance", statusSince: mm.since.getTime(), name: mm.name }
+      return s
+    })
+  }, [])
+
+  useEffect(() => {
+    let es = null
+    let fallbackTimer = null
+
+    function connectSSE() {
+      try {
+        es = new EventSource(`${API_BASE}/api/stream`)
+
+        es.addEventListener("snapshot", (e) => {
+          const data = JSON.parse(e.data)
+          setStations(applyMaintenance(data))
+          setConnected(true); setSource("sse"); setLastUpdate(new Date())
+        })
+        es.addEventListener("update", (e) => {
+          const upd = JSON.parse(e.data)
+          setStations(prev => applyMaintenance(
+            prev.map(s => s.stationID === upd.stationID ? { ...s, ...upd } : s)
+          ))
+          setLastUpdate(new Date())
+        })
+        es.onerror = () => {
+          setConnected(false); setSource("poll")
+          es?.close()
+          fallbackTimer = setTimeout(pollFallback, 5000)
+        }
+      } catch {
+        fallbackTimer = setTimeout(pollFallback, 5000)
+      }
+    }
+
+    async function pollFallback() {
+      try {
+        const r = await fetch(`${API_BASE}/api/stations`)
+        const data = await r.json()
+        setStations(applyMaintenance(data))
+        setConnected(true); setSource("poll"); setLastUpdate(new Date())
+      } catch {
+        setConnected(false)
+        loadDemo()
+      }
+      fallbackTimer = setTimeout(pollFallback, 30000)
+    }
+
+    function loadDemo() {
+      setSource("demo")
+      setConnected(false)
+      const now = Date.now()
+      const hb = s => now - s*1000
+      const tx = s => now - s*1000
+
+      // IDs e nomes reais da ZON — sem invenção
+      const raw = [
+        {stationID:"CPZON01",name:"ZON (PE) Pichilau Vila Esperança — Jaboatão 60KW",    lastHeartbeat:hb(28),    lastTx:tx(800),    avail7d:99.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:600000,  statusSince:now-7200000},
+        {stationID:"CPZON03",name:"ZON (CE) Posto Iguatemi — Fortaleza 60KW",            lastHeartbeat:hb(90),    lastTx:tx(300000), avail7d:0,   allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:0},
+        {stationID:"CPZON04",name:"ZON (PE) Posto BR Caruaru — 60KW",                   lastHeartbeat:hb(33),    lastTx:tx(1200),   avail7d:95.2,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:800000,  statusSince:now-3600000},
+        {stationID:"CPZON05",name:"ZON (RN) Natal Shopping — 60KW",                     lastHeartbeat:hb(20),    lastTx:tx(400),    avail7d:97.8,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:500000,  statusSince:now-1800000},
+        {stationID:"CPZON06",name:"ZON (CE) Shopping RioMar Fortaleza — 60KW",          lastHeartbeat:hb(44),    lastTx:tx(2100),   avail7d:93.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1200000, statusSince:now-5400000},
+        {stationID:"CPZON07",name:"ZON (BA) Shopping Barra Salvador — 60KW",            lastHeartbeat:hb(55),    lastTx:tx(3600),   avail7d:91.0,allConnectorsFaulted:false,connectorsAvailable:false,silentScore:1,silentReasons:["zero_tx_peak"],logAge:2000000, statusSince:now-10800000},
+        {stationID:"CPZON08",name:"ZON (PE) Caruaru BR-232 — 60KW",                     lastHeartbeat:hb(45),    lastTx:tx(3600),   avail7d:72.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:5,silentReasons:["meter_values_frozen","high_abort_rate"],logAge:30000000,statusSince:now-3600000},
+        {stationID:"CPZON09",name:"ZON (RN) Shopping Midway Mall — 60KW",               lastHeartbeat:hb(22),    lastTx:tx(650),    avail7d:98.2,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:400000,  statusSince:now-2400000},
+        {stationID:"CPZON10",name:"ZON (CE) North Shopping Jóquei — 60KW",              lastHeartbeat:hb(31),    lastTx:tx(1800),   avail7d:96.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:900000,  statusSince:now-4500000},
+        {stationID:"CPZON11",name:"ZON (PB) Manaíra Shopping — 60KW",                  lastHeartbeat:hb(18),    lastTx:tx(320),    avail7d:99.3,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:300000,  statusSince:now-900000},
+        {stationID:"CPZON12",name:"ZON (CE) Fortaleza Centro — 60KW",                   lastHeartbeat:hb(30),    lastTx:tx(5400),   avail7d:81.0,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:3,silentReasons:["connector_status_frozen","zero_tx_peak"],logAge:14500000,statusSince:now-5400000},
+        {stationID:"CPZON13",name:"ZON (AL) Parque Shopping Maceió — 60KW",             lastHeartbeat:hb(27),    lastTx:tx(980),    avail7d:97.0,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:700000,  statusSince:now-2700000},
+        {stationID:"CPZON14",name:"ZON (SE) Shopping Jardins Aracaju — 60KW",           lastHeartbeat:hb(40),    lastTx:tx(2400),   avail7d:94.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1500000, statusSince:now-6000000},
+        {stationID:"CPZON15",name:"ZON (BA) Salvador Shopping Iguatemi — 60KW",         lastHeartbeat:hb(22),    lastTx:tx(600),    avail7d:96.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:600000,  statusSince:now-2100000},
+        {stationID:"CPZON16",name:"ZON (PI) Shopping da Cidade Teresina — 60KW",        lastHeartbeat:null,      lastTx:tx(28000),  avail7d:79.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:now-14400000},
+        {stationID:"CPZON17",name:"ZON (MA) São Luís Shopping — 60KW",                  lastHeartbeat:hb(25),    lastTx:tx(750),    avail7d:98.0,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:500000,  statusSince:now-1500000},
+        {stationID:"CPZON18",name:"ZON (PA) Parauapebas Shopping — 60KW",               lastHeartbeat:hb(60),    lastTx:tx(4200),   avail7d:88.7,allConnectorsFaulted:false,connectorsAvailable:false,silentScore:2,silentReasons:["zero_tx_peak"],logAge:4000000,statusSince:now-12600000},
+        {stationID:"CPZON19",name:"ZON (PB) João Pessoa Center — 60KW",                 lastHeartbeat:hb(60),    lastTx:tx(86000),  avail7d:91.2,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1800000, statusSince:now-86400000},
+        {stationID:"CPZON20",name:"ZON (PE) Shopping Recife — 60KW",                    lastHeartbeat:hb(35),    lastTx:tx(1400),   avail7d:95.8,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1100000, statusSince:now-3600000},
+        {stationID:"CPZON21",name:"ZON (RN) Posto Odon — Lajes 60KW",                  lastHeartbeat:hb(18),    lastTx:tx(900),    avail7d:98.7,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:400000,  statusSince:now-1800000},
+        {stationID:"CPZON22",name:"ZON (CE) Shopping Iguatemi Bosque — 60KW",           lastHeartbeat:hb(29),    lastTx:tx(1100),   avail7d:96.9,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:800000,  statusSince:now-3300000},
+        {stationID:"CPZON23",name:"ZON (RN) Via Direta Shopping — 60KW",                lastHeartbeat:hb(41),    lastTx:tx(2800),   avail7d:92.3,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:2100000, statusSince:now-7200000},
+        {stationID:"CPZON24",name:"ZON (BA) Shopping Paralela Salvador — 60KW",         lastHeartbeat:hb(15),    lastTx:tx(200),    avail7d:99.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:200000,  statusSince:now-600000},
+        {stationID:"CPZON25",name:"ZON (PE) Recife Tacaruna — 60KW",                   lastHeartbeat:hb(52),    lastTx:tx(1200),   avail7d:94.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1400000, statusSince:now-3600000},
+        {stationID:"CPZON26",name:"ZON (MG) BH Diamond Mall — 60KW",                   lastHeartbeat:hb(38),    lastTx:tx(1600),   avail7d:95.3,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1000000, statusSince:now-4200000},
+        {stationID:"CPZON27",name:"ZON (MG) BH Savassi — 60KW",                         lastHeartbeat:hb(35),    lastTx:tx(14400),  avail7d:89.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:1,silentReasons:["zero_tx_peak"],logAge:5000000,statusSince:now-14400000},
+        {stationID:"CPZON28",name:"ZON (SP) Madero Santo Amaro — 60KW",                 lastHeartbeat:hb(120),   lastTx:tx(500000), avail7d:0,   allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:0},
+        {stationID:"CPZON29",name:"ZON (SP) Shopping Anália Franco — 60KW",             lastHeartbeat:hb(19),    lastTx:tx(450),    avail7d:98.9,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:350000,  statusSince:now-1200000},
+        {stationID:"CPZON30",name:"ZON (SP) Morumbi Shopping — 60KW",                   lastHeartbeat:hb(24),    lastTx:tx(900),    avail7d:97.6,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:600000,  statusSince:now-2700000},
+        {stationID:"CPZON31",name:"ZON (GO) Goiânia Flamboyant — 60KW",                 lastHeartbeat:hb(29),    lastTx:tx(3200),   avail7d:97.8,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1800000, statusSince:now-9600000},
+        {stationID:"CPZON32",name:"ZON (CE) Pitaguary Mall — Maracanaú 60KW",           lastHeartbeat:hb(110),   lastTx:tx(600000), avail7d:0,   allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:0},
+        {stationID:"CPZON33",name:"ZON (DF) ParkShopping Brasília — 60KW",              lastHeartbeat:hb(28),    lastTx:tx(1050),   avail7d:96.7,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:750000,  statusSince:now-2400000},
+        {stationID:"CPZON35",name:"ZON (RS) Iguatemi Porto Alegre — 60KW",              lastHeartbeat:hb(32),    lastTx:tx(1300),   avail7d:95.9,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:900000,  statusSince:now-3000000},
+        {stationID:"CPZON36",name:"ZON (SC) Florianópolis Beiramar — 60KW",             lastHeartbeat:hb(21),    lastTx:tx(480),    avail7d:98.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:400000,  statusSince:now-1500000},
+        {stationID:"CPZON38",name:"ZON (PE) Petrolina Centro — 60KW",                   lastHeartbeat:hb(41),    lastTx:tx(7200),   avail7d:68.2,allConnectorsFaulted:true, connectorsAvailable:false,silentScore:6,silentReasons:["remote_start_rejected","meter_values_frozen","connector_status_frozen"],logAge:30000000,statusSince:now-7200000},
+        {stationID:"CPZON40",name:"ZON (PE) Recife Tacaruna Norte — 60KW",              lastHeartbeat:hb(52),    lastTx:tx(1200),   avail7d:94.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1200000, statusSince:now-3600000},
+        {stationID:"CPZON42",name:"ZON (RN) Natal Shopping Norte — 60KW",               lastHeartbeat:hb(200),   lastTx:tx(18000),  avail7d:78.3,allConnectorsFaulted:false,connectorsAvailable:false,silentScore:2,silentReasons:["zero_tx_peak"],logAge:8000000,statusSince:now-18000000},
+        {stationID:"CPZON43",name:"ZON (CE) Caucaia Shopping — 60KW",                   lastHeartbeat:hb(36),    lastTx:tx(1700),   avail7d:94.8,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1100000, statusSince:now-4500000},
+        {stationID:"CPZON45",name:"ZON (BA) Shopping Conquista Sul — 60KW",             lastHeartbeat:hb(47),    lastTx:tx(2600),   avail7d:92.0,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:2400000, statusSince:now-7800000},
+        {stationID:"CPZON46",name:"ZON (PI) Teresina Shopping — 60KW",                  lastHeartbeat:hb(23),    lastTx:tx(700),    avail7d:97.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:500000,  statusSince:now-1800000},
+        {stationID:"CPZON48",name:"ZON (MA) Shopping São Luís Norte — 60KW",            lastHeartbeat:hb(43),    lastTx:tx(2200),   avail7d:93.7,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1800000, statusSince:now-6600000},
+        {stationID:"CPZON49",name:"ZON (PA) Belém Shopping — 60KW",                     lastHeartbeat:null,      lastTx:tx(36000),  avail7d:74.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:now-18000000},
+        {stationID:"CPZON50",name:"ZON (AM) Manaus Shopping — 60KW",                    lastHeartbeat:hb(58),    lastTx:tx(3800),   avail7d:89.2,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:3200000, statusSince:now-9600000},
+        {stationID:"CPZON51",name:"ZON (RO) Porto Velho Shopping — 60KW",               lastHeartbeat:hb(26),    lastTx:tx(850),    avail7d:97.1,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:600000,  statusSince:now-2100000},
+        {stationID:"CPZON52",name:"ZON (MT) Cuiabá Shopping — 60KW",                    lastHeartbeat:hb(34),    lastTx:tx(1500),   avail7d:95.5,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1000000, statusSince:now-3900000},
+        {stationID:"CPZON53",name:"ZON (MS) Campo Grande Shopping — 60KW",              lastHeartbeat:hb(17),    lastTx:tx(280),    avail7d:99.0,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:280000,  statusSince:now-840000},
+        {stationID:"CPZON55",name:"ZON (PR) CuritibaShopping — 60KW",                  lastHeartbeat:hb(39),    lastTx:tx(1900),   avail7d:94.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:1500000, statusSince:now-5700000},
+        {stationID:"CPZON56",name:"ZON (SP) Shopping Center Norte — 60KW",              lastHeartbeat:hb(28),    lastTx:tx(1000),   avail7d:96.6,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:700000,  statusSince:now-2700000},
+        {stationID:"CPZON57",name:"ZON (PB) Posto Shell Rodoviária — JP 40KW",          lastHeartbeat:hb(95),    lastTx:tx(420000), avail7d:0,   allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:0,       statusSince:0},
+        {stationID:"CPZON58",name:"ZON (SP) Paulista Shopping — 60KW",                  lastHeartbeat:hb(20),    lastTx:tx(380),    avail7d:98.6,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:320000,  statusSince:now-1140000},
+        {stationID:"CPZON60",name:"ZON (RJ) Shopping Tijuca — 60KW",                    lastHeartbeat:hb(48),    lastTx:tx(2900),   avail7d:91.8,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:2700000, statusSince:now-8700000},
+        {stationID:"CPZON63",name:"ZON (RJ) Barra Shopping — 60KW",                     lastHeartbeat:hb(16),    lastTx:tx(190),    avail7d:99.4,allConnectorsFaulted:false,connectorsAvailable:true,silentScore:0,silentReasons:[],logAge:190000,  statusSince:now-570000},
+      ]
+
+      // Classifica cada estação
+      const OFFLINE_MS = 5*60*1000, IDLE_MS = 4*3600*1000, LOG_CRITICO_MS = 8*3600*1000, SILENT_MIN = 3
+      const classified = raw.map(s => {
+        const mm = MANUAL_MAINTENANCES[s.stationID]
+        if (mm) return { ...s, status:"maintenance", statusSince:mm.since.getTime(), name:mm.name }
+        const hbAge = s.lastHeartbeat ? now - s.lastHeartbeat : Infinity
+        if (hbAge > OFFLINE_MS) return { ...s, status:"offline" }
+        if (s.allConnectorsFaulted) return { ...s, status:"error" }
+        if (s.silentScore >= SILENT_MIN || s.logAge > LOG_CRITICO_MS)
+          return { ...s, status:"error" }
+        const txAge = s.lastTx ? now - s.lastTx : Infinity
+        if (txAge > IDLE_MS && s.connectorsAvailable) return { ...s, status:"unavailable" }
+        return { ...s, status:"operational" }
+      })
+
+      setStations(classified)
+      setLastUpdate(new Date())
+    }
+
+    connectSSE()
+    if (!es || es.readyState === EventSource.CLOSED) loadDemo()
+
+    return () => { es?.close(); clearTimeout(fallbackTimer) }
+  }, [applyMaintenance])
+
+  return { stations, connected, source, lastUpdate }
+}
+
+// ─── COMPONENTES BASE ─────────────────────────────────────────────────────────
+const s = (obj) => obj  // passthrough para legibilidade
+
+function Dot({ status, pulse }) {
+  const cfg = STATUS[status] ?? STATUS.unknown
+  return <span style={{ display:"inline-block", width:7, height:7, borderRadius:"50%",
+    background:cfg.dot, marginRight:5, flexShrink:0,
+    boxShadow: pulse ? `0 0 5px ${cfg.dot}88` : "none" }} />
+}
+
+function Badge({ status }) {
+  const cfg = STATUS[status] ?? STATUS.unknown
+  return (
+    <span style={{ display:"inline-flex", alignItems:"center", padding:"2px 9px",
+      borderRadius:20, fontSize:11, fontWeight:700, letterSpacing:"0.02em",
+      background:cfg.bg, color:cfg.dot, border:`0.5px solid ${cfg.border}40`,
+      whiteSpace:"nowrap" }}>
+      <Dot status={status} pulse={["error","offline"].includes(status)} />
+      {cfg.label}
+    </span>
+  )
+}
+
+function ScorePill({ score, reasons }) {
+  if (!score) return null
+  const col = score >= 5 ? C.red : score >= 3 ? C.orange : C.yellow
+  return (
+    <span title={reasons?.map(r=>SILENT_LABEL[r]||r).join(", ")}
+      style={{ fontSize:10, padding:"2px 7px", borderRadius:20, fontWeight:700, cursor:"help",
+        background:`${col}15`, color:col, border:`0.5px solid ${col}50` }}>
+      ⚠ {score}
+    </span>
+  )
+}
+
+function Card({ children, style, accent }) {
+  return (
+    <div style={{ background:C.card, borderRadius:12, padding:"16px 18px",
+      border:`0.5px solid ${accent ? accent+"40" : C.border}`, ...style }}>
+      {children}
+    </div>
+  )
+}
+
+function SLabel({ children, right }) {
+  return (
+    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+      <span style={{ fontSize:10, fontWeight:800, color:C.yellow, letterSpacing:"0.14em",
+        textTransform:"uppercase" }}>{children}</span>
+      {right && <span style={{ fontSize:11, color:C.gray }}>{right}</span>}
+    </div>
+  )
+}
+
+// ─── STAT CARDS ───────────────────────────────────────────────────────────────
+function StatCards({ stations }) {
+  const c = {operational:0,offline:0,error:0,maintenance:0,unavailable:0}
+  stations.forEach(s => { if(c[s.status]!==undefined) c[s.status]++ })
+  const opStations = stations.filter(s=>s.status==="operational"&&s.avail7d>0)
+  const avgAvail = opStations.length
+    ? (opStations.reduce((a,s)=>a+s.avail7d,0)/opStations.length).toFixed(1)
+    : "—"
+  const critical = c.offline + c.error
+
+  const cards = [
+    {label:"Total", value:stations.length, color:C.white},
+    {label:"Disponibilidade", value:`${avgAvail}%`, color: avgAvail>=95?C.green:avgAvail>=80?C.orange:C.red, sub:"média operantes"},
+    {label:"Operantes", value:c.operational, color:C.green},
+    {label:"Críticos", value:critical, color:critical>0?C.red:C.green, sub:`${c.offline} offline · ${c.error} erro`},
+    {label:"Indisponível", value:c.unavailable, color:c.unavailable>0?C.blue:C.gray},
+    {label:"Manutenção", value:c.maintenance, color:C.yellow},
+  ]
+  return (
+    <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:18}}>
+      {cards.map(c=>(
+        <div key={c.label} style={{background:C.grayDim,borderRadius:10,padding:"12px 14px",border:`0.5px solid ${C.border}`}}>
+          <div style={{fontSize:11,color:C.gray,marginBottom:3}}>{c.label}</div>
+          <div style={{fontSize:20,fontWeight:800,color:c.color,lineHeight:1}}>{c.value}</div>
+          {c.sub&&<div style={{fontSize:10,color:C.gray,marginTop:3}}>{c.sub}</div>}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── QUADRO CRÍTICO ───────────────────────────────────────────────────────────
+function CriticalBoard({ stations }) {
+  const now = Date.now()
+  const critical = stations
+    .filter(s=>["maintenance","unavailable"].includes(s.status))
+    .sort((a,b)=>a.statusSince-b.statusSince)
+
+  if (!critical.length) return (
+    <Card style={{marginBottom:16}}>
+      <SLabel>Quadro crítico</SLabel>
+      <div style={{fontSize:12,color:C.green}}>Sem estações em manutenção ou indisponível.</div>
+    </Card>
+  )
+
+  return (
+    <Card style={{marginBottom:16}} accent={C.yellow}>
+      <SLabel right={`${critical.length} estação${critical.length>1?"s":""}`}>Quadro crítico — manutenção & indisponível</SLabel>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))",gap:10}}>
+        {critical.map(s=>{
+          const cfg = STATUS[s.status]
+          const mm = MANUAL_MAINTENANCES[s.stationID]
+          return (
+            <div key={s.stationID} style={{borderRadius:8,padding:"12px 14px",
+              background:cfg.bg, borderLeft:`3px solid ${cfg.border}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                <div style={{flex:1,minWidth:0,marginRight:8}}>
+                  <div style={{fontSize:12,fontWeight:700,color:C.white,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}
+                    title={s.name}>{s.name}</div>
+                  <div style={{fontSize:11,color:C.gray,fontFamily:"monospace",marginTop:2}}>{s.stationID}</div>
+                </div>
+                <Badge status={s.status}/>
+              </div>
+              <div style={{display:"flex",gap:16}}>
+                <div>
+                  <div style={{fontSize:10,color:C.gray,marginBottom:2}}>Tempo no estado</div>
+                  <div style={{fontSize:17,fontWeight:800,color:cfg.dot}}>{dur(now-s.statusSince)}</div>
+                </div>
+                <div>
+                  <div style={{fontSize:10,color:C.gray,marginBottom:2}}>
+                    {mm?"Início (confirmado)":"Desde"}
+                  </div>
+                  <div style={{fontSize:12,color:C.white,fontWeight:600}}>
+                    {fmtDate(s.statusSince)}
+                    {mm&&<span style={{fontSize:10,color:C.yellow,marginLeft:5}}>✓</span>}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </Card>
+  )
+}
+
+// ─── DETAIL MODAL ─────────────────────────────────────────────────────────────
+function DetailPanel({ station, onClose }) {
+  const now = Date.now()
+  if (!station) return null
+  const cfg = STATUS[station.status] ?? STATUS.unknown
+
+  return (
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,
+      background:"rgba(0,0,0,0.8)",zIndex:100,display:"flex",
+      alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{background:C.card,borderRadius:14,width:"100%",maxWidth:620,
+        border:`0.5px solid ${cfg.border}40`,padding:24,maxHeight:"80vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:C.white}}>{station.name}</div>
+            <div style={{fontSize:12,color:C.gray,fontFamily:"monospace",marginTop:2}}>{station.stationID}</div>
+          </div>
+          <button onClick={onClose} style={{fontSize:12,padding:"5px 12px",borderRadius:8,
+            border:`0.5px solid ${C.border2}`,background:"transparent",color:C.gray,cursor:"pointer"}}>
+            fechar
+          </button>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:16}}>
+          {[
+            ["Status",       <Badge status={station.status}/>],
+            ["Tempo no estado", dur(now-station.statusSince)],
+            ["Disponibilidade 7d", station.avail7d>0?`${station.avail7d.toFixed(1)}%`:"—"],
+            ["Último heartbeat", ago(station.lastHeartbeat)],
+            ["Última transação", ago(station.lastTx)],
+            ["Potência", station.power?`${station.power} kW`:"—"],
+            ["Firmware", station.firmware??"—"],
+            ["Fabricante", station.vendor??"—"],
+            ["Modelo", station.model??"—"],
+          ].map(([k,v])=>(
+            <div key={k} style={{background:C.grayDim,borderRadius:8,padding:"10px 12px",border:`0.5px solid ${C.border}`}}>
+              <div style={{fontSize:10,color:C.gray,marginBottom:3}}>{k}</div>
+              <div style={{fontSize:13,fontWeight:600,color:C.white}}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        {station.silentReasons?.length>0&&(
+          <div style={{marginBottom:14}}>
+            <div style={{fontSize:11,color:C.orange,marginBottom:8,fontWeight:700}}>
+              Sinais de falha silenciosa — score {station.silentScore}
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {station.silentReasons.map(r=>(
+                <span key={r} style={{fontSize:11,padding:"3px 10px",borderRadius:20,
+                  background:C.orangeDim,color:C.orange,border:`0.5px solid ${C.orange}40`}}>
+                  {SILENT_LABEL[r]||r}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {station.connectors?.length>0&&(
+          <div>
+            <div style={{fontSize:11,color:C.gray,marginBottom:8,fontWeight:700}}>Conectores</div>
+            <div style={{display:"flex",gap:8}}>
+              {station.connectors.map(c=>{
+                const col = c.lastStatus==="Available"?C.green:c.lastStatus==="Charging"?C.yellow:C.red
+                return (
+                  <div key={c.connectorId} style={{flex:1,borderRadius:8,padding:"8px 12px",
+                    background:`${col}15`,border:`0.5px solid ${col}40`}}>
+                    <div style={{fontSize:11,color:C.gray}}>Conector {c.connectorId}</div>
+                    <div style={{fontSize:13,fontWeight:700,color:col}}>{c.lastStatus}</div>
+                    {c.lastStatusTimestamp&&(
+                      <div style={{fontSize:10,color:C.gray,marginTop:2}}>
+                        {ago(new Date(c.lastStatusTimestamp).getTime())}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── TABELA PRINCIPAL ─────────────────────────────────────────────────────────
+function StationTable({ stations, onSelect }) {
+  const [filter, setFilter] = useState("all")
+  const [search, setSearch] = useState("")
+  const [sortKey, setSortKey] = useState("status")
+  const now = Date.now()
+
+  const ORDER = {offline:0,error:1,unavailable:2,maintenance:3,operational:4,unknown:5}
+
+  const rows = stations
+    .filter(s=>filter==="all"||s.status===filter)
+    .filter(s=>
+      s.stationID.toLowerCase().includes(search.toLowerCase())||
+      s.name.toLowerCase().includes(search.toLowerCase())
+    )
+    .sort((a,b)=>{
+      if (sortKey==="avail") return a.avail7d - b.avail7d
+      if (sortKey==="score") return b.silentScore - a.silentScore
+      if (sortKey==="hb") return (b.lastHeartbeat??0)-(a.lastHeartbeat??0)
+      return (ORDER[a.status]??5)-(ORDER[b.status]??5)
+    })
+
+  const btn = (active,label,onClick) => (
+    <button onClick={onClick} style={{fontSize:11,padding:"4px 11px",borderRadius:20,cursor:"pointer",
+      border:`0.5px solid ${active?C.yellow:C.border}`,
+      background:active?C.yellowDim:"transparent",
+      color:active?C.yellow:C.gray,fontWeight:active?700:400}}>
+      {label}
+    </button>
+  )
+
+  const TH = ({children,w}) => (
+    <th style={{fontSize:10,fontWeight:700,color:C.gray,padding:"7px 10px",textAlign:"left",
+      borderBottom:`0.5px solid ${C.border}`,textTransform:"uppercase",letterSpacing:"0.06em",
+      whiteSpace:"nowrap",width:w}}>
+      {children}
+    </th>
+  )
+  const TD = ({children,mono,dim,right}) => (
+    <td style={{padding:"8px 10px",fontSize:12,color:dim?C.gray:C.white,verticalAlign:"middle",
+      borderBottom:`0.5px solid ${C.border}50`,fontFamily:mono?"monospace":undefined,
+      textAlign:right?"right":undefined}}>
+      {children}
+    </td>
+  )
+
+  const counts = {all:stations.length}
+  stations.forEach(s=>{counts[s.status]=(counts[s.status]??0)+1})
+
+  return (
+    <Card>
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+        <SLabel right={`${rows.length} de ${stations.length}`}>Todas as estações</SLabel>
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)}
+          placeholder="buscar ID ou nome..."
+          style={{fontSize:12,padding:"5px 10px",borderRadius:8,
+            border:`0.5px solid ${C.border2}`,background:"#0d0d0d",
+            color:C.white,outline:"none",width:200}}/>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+          {[["all","todos"],["operational","Operante"],["offline","Offline"],
+            ["error","Erro"],["unavailable","Indisponível"],["maintenance","Manutenção"]
+          ].map(([k,v])=>btn(filter===k,`${v} (${counts[k]??0})`,()=>setFilter(k)))}
+        </div>
+        <div style={{marginLeft:"auto",display:"flex",gap:5,alignItems:"center"}}>
+          <span style={{fontSize:11,color:C.gray}}>ordenar:</span>
+          {[["status","status"],["avail","disp."],["score","score"],["hb","heartbeat"]].map(([k,v])=>
+            btn(sortKey===k,v,()=>setSortKey(k))
+          )}
+        </div>
+      </div>
+
+      <div style={{overflowX:"auto"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr style={{background:"#0d0d0d"}}>
+              <TH w="9%">ID</TH>
+              <TH w="26%">Nome da estação</TH>
+              <TH w="11%">Status</TH>
+              <TH w="10%">Heartbeat</TH>
+              <TH w="10%">Último tx</TH>
+              <TH w="9%">Tempo estado</TH>
+              <TH w="9%">Sem uso</TH>
+              <TH w="8%">Disp. 7d</TH>
+              <TH w="8%">Score</TH>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((s,i)=>{
+              const hbAge = s.lastHeartbeat ? now-s.lastHeartbeat : null
+              const txAge = s.lastTx ? now-s.lastTx : null
+              const hbCol = !hbAge ? C.red : hbAge>120000 ? C.orange : C.gray
+              const availCol = s.avail7d>=95?C.green:s.avail7d>=80?C.orange:C.red
+              return (
+                <tr key={s.stationID}
+                  onClick={()=>onSelect(s)}
+                  style={{background:i%2===0?"transparent":"#0c0c0c",cursor:"pointer"}}>
+                  <TD mono dim>{s.stationID}</TD>
+                  <td style={{padding:"8px 10px",fontSize:12,color:C.white,
+                    borderBottom:`0.5px solid ${C.border}50`,overflow:"hidden",
+                    textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:0}}
+                    title={s.name}>{s.name}</td>
+                  <TD><Badge status={s.status}/></TD>
+                  <td style={{padding:"8px 10px",fontSize:12,color:hbCol,
+                    borderBottom:`0.5px solid ${C.border}50`}}>
+                    {hbAge?dur(hbAge)+" atrás":"sem sinal"}
+                  </td>
+                  <TD dim>{txAge?dur(txAge)+" atrás":"—"}</TD>
+                  <TD dim>{dur(now-s.statusSince)}</TD>
+                  <TD dim>{txAge?dur(txAge):"—"}</TD>
+                  <td style={{padding:"8px 10px",fontSize:12,fontWeight:700,
+                    color:s.avail7d>0?availCol:C.gray,
+                    borderBottom:`0.5px solid ${C.border}50`}}>
+                    {s.avail7d>0?`${s.avail7d.toFixed(1)}%`:"—"}
+                  </td>
+                  <TD><ScorePill score={s.silentScore} reasons={s.silentReasons}/></TD>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  )
+}
+
+// ─── ALERTS ───────────────────────────────────────────────────────────────────
+function AlertPanel({ stations }) {
+  const now = Date.now()
+  const alerts = stations
+    .filter(s=>["offline","error"].includes(s.status))
+    .sort((a,b)=>{
+      const o={offline:0,error:1}
+      return (o[a.status]??2)-(o[b.status]??2)
+    })
+
+  if (!alerts.length) return null
+
+  return (
+    <Card style={{marginBottom:16}} accent={C.red}>
+      <SLabel right={`${alerts.length} ativo${alerts.length>1?"s":""}`}>
+        Alertas críticos
+      </SLabel>
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>
+        {alerts.map(s=>{
+          const col = s.status==="offline"?C.red:C.orange
+          return (
+            <div key={s.stationID} style={{display:"flex",alignItems:"center",gap:10,
+              padding:"7px 10px",borderRadius:6,background:"#0d0d0d",
+              borderLeft:`3px solid ${col}`}}>
+              <span style={{fontSize:11,fontFamily:"monospace",color:C.gray,minWidth:80}}>{s.stationID}</span>
+              <span style={{fontSize:12,fontWeight:600,color:C.white,flex:1,overflow:"hidden",
+                textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}</span>
+              <Badge status={s.status}/>
+              <span style={{fontSize:11,color:C.gray,whiteSpace:"nowrap"}}>{dur(now-s.statusSince)}</span>
+              {s.silentScore>0&&<ScorePill score={s.silentScore} reasons={s.silentReasons}/>}
+            </div>
+          )
+        })}
+      </div>
+    </Card>
+  )
+}
+
+// ─── APP ROOT ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const { stations, connected, source, lastUpdate } = useStations()
+  const [detail, setDetail] = useState(null)
+  const [now, setNow] = useState(Date.now())
+
+  useEffect(()=>{
+    const t = setInterval(()=>setNow(Date.now()), 5000)
+    return ()=>clearInterval(t)
+  },[])
+
+  const critical = stations.filter(s=>["offline","error"].includes(s.status)).length
+  const srcColor = source==="sse"?C.green:source==="poll"?C.yellow:C.gray
+  const srcLabel = source==="sse"?"SSE":source==="poll"?"polling REST":"demo"
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",padding:"18px 22px",
+      fontFamily:"'Inter','Segoe UI',sans-serif",color:C.white}}>
+
+      {/* HEADER */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:34,height:34,borderRadius:7,background:C.yellow,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <div style={{width:18,height:18,borderRadius:3,background:C.bg}}/>
+          </div>
+          <div>
+            <div style={{fontSize:17,fontWeight:800,letterSpacing:"-0.02em"}}>
+              ZON <span style={{color:C.yellow}}>Sentinela</span>
+            </div>
+            <div style={{fontSize:11,color:C.gray}}>Monitoramento em tempo real · {stations.length} estações</div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          {critical>0&&(
+            <div style={{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",
+              borderRadius:20,background:C.redDim,border:`0.5px solid ${C.red}50`}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:C.red,
+                boxShadow:`0 0 6px ${C.red}`}}/>
+              <span style={{fontSize:12,fontWeight:700,color:C.red}}>
+                {critical} crítico{critical>1?"s":""}
+              </span>
+            </div>
+          )}
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:11,color:srcColor,fontWeight:600}}>
+              ● {srcLabel}
+            </div>
+            <div style={{fontSize:10,color:C.gray}}>
+              {lastUpdate?fmtTime(lastUpdate):"—"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <StatCards stations={stations}/>
+      <CriticalBoard stations={stations}/>
+      <AlertPanel stations={stations}/>
+      <StationTable stations={stations} onSelect={setDetail}/>
+
+      {detail&&<DetailPanel station={detail} onClose={()=>setDetail(null)}/>}
+
+      <div style={{marginTop:16,fontSize:10,color:"#333",textAlign:"center"}}>
+        ZON Sentinela · fonte: {srcLabel} · nomes via /select/connected_stations ·
+        IDs canônicos via /connected_stations
+      </div>
+    </div>
+  )
+}

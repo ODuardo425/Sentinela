@@ -1,0 +1,8 @@
+Invoke-WebRequest : Imposs¡vel conectar-se ao servidor remoto
+No linha:1 caractere:2
++ (Invoke-WebRequest -Uri 'http://localhost:3001/api/historico?periodo= ...
++  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (System.Net.HttpWebRequest:HttpWebRequest) [Invoke-WebRequest], WebExc 
+   eption
+    + FullyQualifiedErrorId : WebCmdletWebResponseException,Microsoft.PowerShell.Commands.InvokeWebRequestCommand
+ 

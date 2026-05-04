@@ -1,0 +1,4 @@
+TUPI_EMAIL=evertonmedeiros2004@hotmail.com
+TUPI_PASSWORD=Ufrn.12345
+REDIS_URL=redis://127.0.0.1:6379
+PORT=3001
